@@ -1,0 +1,10 @@
+services:
+  filegdb-import-worker:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      CORS_ORIGINS: "*"
+      MAX_UPLOAD_MB: "512"
+      CONVERT_TIMEOUT_SECONDS: "1800"
+      KEEP_WORKER_TEMP: "false"
