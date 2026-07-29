@@ -4,7 +4,12 @@ services:
     ports:
       - "8080:8080"
     environment:
-      CORS_ORIGINS: "*"
+      # Local-only development escape hatch. Never enable in production.
+      ALLOW_UNAUTHENTICATED: "true"
+      CORS_ORIGINS: "http://localhost:5173,http://127.0.0.1:5173,http://localhost,https://localhost,capacitor://localhost"
       MAX_UPLOAD_MB: "512"
+      MAX_EXTRACTED_MB: "2048"
+      MAX_ZIP_MEMBERS: "100000"
+      MAX_CONCURRENT_CONVERSIONS: "1"
       CONVERT_TIMEOUT_SECONDS: "1800"
       KEEP_WORKER_TEMP: "false"

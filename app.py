@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import re
@@ -14,14 +15,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 
+from archive_limits import ArchiveLimitError, validate_archive_infos
 from mapplex_attachments import promote_esri_attachment_tables
 from mapplex_schema import extract_domain_metadata, write_mapplex_schema_tables
+from worker_auth import AuthenticationError, authentication_status, require_token
 
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "512"))
+MAX_EXTRACTED_MB = int(os.getenv("MAX_EXTRACTED_MB", "2048"))
+MAX_ZIP_MEMBERS = int(os.getenv("MAX_ZIP_MEMBERS", "100000"))
 CONVERT_TIMEOUT_SECONDS = int(os.getenv("CONVERT_TIMEOUT_SECONDS", "1800"))
-WORKER_TOKEN = os.getenv("GDB_IMPORT_WORKER_TOKEN", "").strip()
 CORS_ORIGINS = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "*").split(",") if origin.strip()]
+MAX_CONCURRENT_CONVERSIONS = max(1, int(os.getenv("MAX_CONCURRENT_CONVERSIONS", "1")))
+CONVERSION_SLOTS = asyncio.Semaphore(MAX_CONCURRENT_CONVERSIONS)
 
 app = FastAPI(title="Mapplex FileGDB Import Worker", version="0.1.0")
 app.add_middleware(
@@ -33,13 +39,32 @@ app.add_middleware(
 )
 
 
-def require_token(request: Request):
-    if not WORKER_TOKEN:
-        return
-    auth = request.headers.get("authorization", "")
-    token = auth.removeprefix("Bearer ").strip() if auth.lower().startswith("bearer ") else auth.strip()
-    if token != WORKER_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid FileGDB worker token.")
+@app.middleware("http")
+async def authenticate_conversion_before_upload(request: Request, call_next):
+    if request.method == "POST" and request.url.path == "/convert-filegdb":
+        # Authenticate before FastAPI parses or writes the multipart upload.
+        try:
+            request.state.worker_identity = await asyncio.to_thread(require_token, request.headers)
+        except AuthenticationError as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+        # Bound upload parsing, temporary disk expansion, and GDAL subprocesses
+        # together. A direct-upload worker should reject overload rather than
+        # queue multiple large multipart bodies in memory or ephemeral storage.
+        try:
+            await asyncio.wait_for(CONVERSION_SLOTS.acquire(), timeout=0.1)
+        except TimeoutError:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "FileGDB worker is busy. Retry shortly."},
+                headers={"Retry-After": "5"},
+            )
+        try:
+            return await call_next(request)
+        finally:
+            CONVERSION_SLOTS.release()
+
+    return await call_next(request)
 
 
 def safe_name(value, fallback="filegdb"):
@@ -51,9 +76,17 @@ def safe_name(value, fallback="filegdb"):
 def ensure_filegdb_zip(path):
     try:
         with zipfile.ZipFile(path) as zf:
-            names = [name.replace("\\", "/") for name in zf.namelist()]
+            infos = zf.infolist()
+            validate_archive_infos(
+                infos,
+                max_members=MAX_ZIP_MEMBERS,
+                max_uncompressed_bytes=MAX_EXTRACTED_MB * 1024 * 1024,
+            )
+            names = [info.filename.replace("\\", "/") for info in infos]
     except zipfile.BadZipFile as exc:
         raise HTTPException(status_code=400, detail="Upload is not a valid ZIP archive.") from exc
+    except ArchiveLimitError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
     has_gdb_folder = any(
         len(parts := name.split("/")) > 1 and parts[0].lower().endswith(".gdb")
@@ -192,7 +225,11 @@ def gpkg_feature_summary(gpkg_path: Path):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "filegdb-import-worker"}
+    return {
+        "ok": True,
+        "service": "filegdb-import-worker",
+        "authentication": authentication_status(),
+    }
 
 
 @app.post("/convert-filegdb")
@@ -204,8 +241,6 @@ async def convert_filegdb(
     return_format: str = Form("gpkg"),
     include_domains: str = Form("true"),
 ):
-    require_token(request)
-
     if return_format.lower() != "gpkg":
         raise HTTPException(status_code=400, detail="Only return_format=gpkg is supported.")
 
