@@ -30,14 +30,6 @@ MAX_CONCURRENT_CONVERSIONS = max(1, int(os.getenv("MAX_CONCURRENT_CONVERSIONS", 
 CONVERSION_SLOTS = asyncio.Semaphore(MAX_CONCURRENT_CONVERSIONS)
 
 app = FastAPI(title="Mapplex FileGDB Import Worker", version="0.1.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=CORS_ORIGINS or ["*"],
-    allow_credentials=False,
-    allow_methods=["POST", "GET", "OPTIONS"],
-    allow_headers=["*"],
-)
-
 
 @app.middleware("http")
 async def authenticate_conversion_before_upload(request: Request, call_next):
@@ -65,6 +57,19 @@ async def authenticate_conversion_before_upload(request: Request, call_next):
             CONVERSION_SLOTS.release()
 
     return await call_next(request)
+
+
+# Register CORS last so it is the outermost ASGI middleware. Authentication and
+# overload responses return before call_next(); without this ordering WebView
+# receives a response without CORS headers and reports a misleading network
+# failure instead of the actionable 401/503 response body.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS or ["*"],
+    allow_credentials=False,
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 
 def safe_name(value, fallback="filegdb"):
