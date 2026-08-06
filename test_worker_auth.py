@@ -1,6 +1,7 @@
 import json
 import unittest
 import urllib.error
+from pathlib import Path
 from unittest.mock import patch
 
 import worker_auth
@@ -21,6 +22,15 @@ class _Response:
 
 
 class WorkerAuthenticationTests(unittest.TestCase):
+    def test_cors_wraps_early_authentication_responses(self):
+        source = Path(__file__).with_name("app.py").read_text(encoding="utf-8")
+        auth_registration = source.index('@app.middleware("http")')
+        cors_registration = source.index("app.add_middleware(\n    CORSMiddleware")
+
+        # Starlette inserts newly registered middleware at the outside of the
+        # stack. CORS must therefore be registered after the auth middleware.
+        self.assertLess(auth_registration, cors_registration)
+
     def test_fails_closed_when_authentication_is_not_configured(self):
         with patch.multiple(
             worker_auth,

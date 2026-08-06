@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 
 from archive_limits import ArchiveLimitError, validate_archive_infos
+from filegdb_export import GeoPackageExportError, create_filegdb_zip, inspect_export_geopackage
 from mapplex_attachments import promote_esri_attachment_tables
 from mapplex_schema import extract_domain_metadata, write_mapplex_schema_tables
 from worker_auth import AuthenticationError, authentication_status, require_token
@@ -29,11 +30,11 @@ CORS_ORIGINS = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "*").spli
 MAX_CONCURRENT_CONVERSIONS = max(1, int(os.getenv("MAX_CONCURRENT_CONVERSIONS", "1")))
 CONVERSION_SLOTS = asyncio.Semaphore(MAX_CONCURRENT_CONVERSIONS)
 
-app = FastAPI(title="Mapplex FileGDB Import Worker", version="0.1.0")
+app = FastAPI(title="Mapplex FileGDB Conversion Worker", version="0.2.0")
 
 @app.middleware("http")
 async def authenticate_conversion_before_upload(request: Request, call_next):
-    if request.method == "POST" and request.url.path == "/convert-filegdb":
+    if request.method == "POST" and request.url.path in ("/convert-filegdb", "/export-filegdb"):
         # Authenticate before FastAPI parses or writes the multipart upload.
         try:
             request.state.worker_identity = await asyncio.to_thread(require_token, request.headers)
@@ -146,7 +147,7 @@ def extract_filegdb_zip(path: Path, extract_root: Path):
     raise HTTPException(status_code=400, detail="ZIP archive does not contain a readable FileGDB directory.")
 
 
-async def save_upload(upload: UploadFile, target_path: Path):
+async def save_upload(upload: UploadFile, target_path: Path, label="Upload"):
     total = 0
     with target_path.open("wb") as out:
         while True:
@@ -155,7 +156,7 @@ async def save_upload(upload: UploadFile, target_path: Path):
                 break
             total += len(chunk)
             if total > MAX_UPLOAD_MB * 1024 * 1024:
-                raise HTTPException(status_code=413, detail=f"FileGDB ZIP exceeds {MAX_UPLOAD_MB} MB limit.")
+                raise HTTPException(status_code=413, detail=f"{label} exceeds {MAX_UPLOAD_MB} MB limit.")
             out.write(chunk)
     return total
 
@@ -193,9 +194,20 @@ def convert_filegdb_to_gpkg(source_path, output_path):
         "-f", "GPKG",
         str(output_path),
         str(source_path),
+        "-oo", "LIST_ALL_TABLES=YES",
         "-nlt", "PROMOTE_TO_MULTI",
         "-lco", "SPATIAL_INDEX=YES",
         "-skipfailures",
+    ])
+
+
+def convert_gpkg_to_filegdb(source_path, output_path):
+    run_command([
+        "ogr2ogr",
+        "-f", "OpenFileGDB",
+        str(output_path),
+        str(source_path),
+        "-oo", "LIST_ALL_TABLES=YES",
     ])
 
 
@@ -232,7 +244,7 @@ def gpkg_feature_summary(gpkg_path: Path):
 def health():
     return {
         "ok": True,
-        "service": "filegdb-import-worker",
+        "service": "filegdb-conversion-worker",
         "authentication": authentication_status(),
     }
 
@@ -256,7 +268,7 @@ async def convert_filegdb(
         source_path = temp_root / upload_name
         output_path = temp_root / f"mapplex_filegdb_{uuid.uuid4().hex}.gpkg"
 
-        await save_upload(file, source_path)
+        await save_upload(file, source_path, "FileGDB ZIP")
         ensure_filegdb_zip(source_path)
 
         source_gdb_path = extract_filegdb_zip(source_path, temp_root / "extract")
@@ -296,6 +308,71 @@ async def convert_filegdb(
             output_path,
             media_type="application/geopackage+sqlite3",
             filename=response_name,
+            headers=headers,
+            background=background,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+    finally:
+        if file:
+            await file.close()
+        if not success_response and os.getenv("KEEP_WORKER_TEMP", "").lower() != "true":
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+
+@app.post("/export-filegdb")
+async def export_filegdb(
+    request: Request,
+    file: UploadFile = File(...),
+    project_id: str = Form(""),
+    project_name: str = Form(""),
+    return_format: str = Form("gdb_zip"),
+):
+    if return_format.lower() != "gdb_zip":
+        raise HTTPException(status_code=400, detail="Only return_format=gdb_zip is supported.")
+
+    temp_root = Path(tempfile.mkdtemp(prefix="mapplex-filegdb-export-"))
+    success_response = False
+    try:
+        upload_name = safe_name(file.filename, "mapplex_export.gpkg")
+        source_path = temp_root / upload_name
+        await save_upload(file, source_path, "GeoPackage")
+
+        try:
+            feature_summary = inspect_export_geopackage(source_path)
+        except GeoPackageExportError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        source_stem = re.sub(r"\.gpkg$", "", upload_name, flags=re.IGNORECASE)
+        response_base = safe_name(project_name or source_stem, "mapplex_export")[:80]
+        output_gdb = temp_root / f"{response_base}.gdb"
+        output_zip = temp_root / f"{response_base}.gdb.zip"
+
+        convert_gpkg_to_filegdb(source_path, output_gdb)
+        ogr_json = read_ogrinfo_json(output_gdb)
+        if not layer_names_from_ogrinfo(ogr_json):
+            raise HTTPException(status_code=422, detail="GDAL created a FileGDB without readable layers.")
+        try:
+            create_filegdb_zip(output_gdb, output_zip)
+        except GeoPackageExportError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        feature_count = sum(item["rows"] for item in feature_summary)
+        headers = {
+            "X-Mapplex-Feature-Count": str(feature_count),
+            "X-Mapplex-Layer-Count": str(len(feature_summary)),
+            "X-Mapplex-Project-Id": project_id,
+        }
+        background = None
+        if os.getenv("KEEP_WORKER_TEMP", "").lower() != "true":
+            background = BackgroundTask(shutil.rmtree, temp_root, ignore_errors=True)
+        success_response = True
+        return FileResponse(
+            output_zip,
+            media_type="application/zip",
+            filename=f"{response_base}.gdb.zip",
             headers=headers,
             background=background,
         )

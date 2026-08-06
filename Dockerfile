@@ -9,7 +9,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN python3 -m pip install --break-system-packages --no-cache-dir -r requirements.txt
 
-COPY app.py worker_auth.py archive_limits.py mapplex_schema.py mapplex_attachments.py ./
+COPY app.py worker_auth.py archive_limits.py filegdb_export.py mapplex_schema.py mapplex_attachments.py ./
 
 ENV PORT=8080
 ENV MAX_UPLOAD_MB=512

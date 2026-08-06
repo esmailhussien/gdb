@@ -1,11 +1,13 @@
-# Mapplex FileGDB Import Worker
+# Mapplex FileGDB Conversion Worker
 
 External GDAL/OpenFileGDB worker for importing Esri File Geodatabase archives
-into Mapplex.
+into Mapplex and exporting Mapplex GeoPackages as zipped FileGDB directories.
 
-The frontend sends `.gdb.zip` files here. The worker converts them to a
-GeoPackage and injects Mapplex domain metadata tables so the existing app import
-path can create lexicons and field bindings.
+The frontend sends `.gdb.zip` files to the import endpoint or a locally built
+`.gpkg` to the export endpoint. Import injects Mapplex domain metadata so the
+existing app pipeline can create lexicons and field bindings. Export preserves
+typed fields, geometries, CRS, native coded domains, and the bounded Mapplex
+round-trip metadata table created by the app.
 
 ## Why A Worker?
 
@@ -36,20 +38,23 @@ Point Mapplex at it:
 VITE_GDB_IMPORT_WORKER_URL=http://localhost:8080/convert-filegdb
 ```
 
-In Vite dev mode, Mapplex defaults to
-`http://localhost:8080/convert-filegdb` when `VITE_GDB_IMPORT_WORKER_URL` is not
-set. Production builds still require an explicit worker URL.
+Put that override in the frontend's `.env.local` only when the Docker worker is
+actually running. Without an override, Vite development calls
+`/gdb-worker/convert-filegdb`; the Vite server proxies that route to
+`https://gdb.geova.net/convert-filegdb`. Production builds use the canonical
+hosted URL directly.
 
 ## Smoke Test
 
 The schema/domain bridge can be tested without Docker or a real FileGDB:
 
 ```bash
-python -m unittest test_archive_limits.py test_worker_auth.py test_mapplex_schema.py
+python -m unittest test_archive_limits.py test_worker_auth.py test_mapplex_schema.py test_filegdb_export.py
 ```
 
-This verifies that `ogrinfo -json`-style coded domains are converted into
-Mapplex metadata and written into the SQLite/GPKG tables consumed by the app.
+This verifies archive limits, authentication, domain bridging, GeoPackage
+validation, and the required `.gdb/` ZIP layout without requiring a live GDAL
+conversion.
 
 ## Optional Worker Environment
 
@@ -70,6 +75,14 @@ For production, the frontend sends the signed-in user's short-lived Supabase
 access token. The worker validates it against `SUPABASE_URL/auth/v1/user`
 *before* FastAPI parses the multipart upload. `SUPABASE_ANON_KEY` is the public
 project key used to call Supabase Auth; do not configure a service-role key.
+The CORS middleware intentionally wraps this authentication middleware so 401,
+503, and overload responses remain readable by Capacitor WebView instead of
+being collapsed into a generic browser network error.
+
+Before uploading a large archive, Mapplex probes `GET /health` for up to two
+minutes. This accommodates free-instance cold starts without automatically
+replaying a multipart conversion request. The user session is restored or
+refreshed after the readiness check and immediately before the upload.
 
 `GDB_IMPORT_WORKER_TOKEN` remains available for private server-to-server
 automation, but it must never be placed in a `VITE_*` variable or browser
@@ -141,16 +154,31 @@ Response:
   - `X-Mapplex-Domain-Count`
   - `X-Mapplex-Field-Domain-Count`
 
+`POST /export-filegdb`
+
+Multipart fields:
+
+- `file`: a Mapplex-generated `.gpkg`
+- `project_id`: optional Mapplex project id for response diagnostics
+- `project_name`: optional safe output basename
+- `return_format`: must be `gdb_zip`
+
+Response:
+
+- `200 application/zip`
+- body is `<project>.gdb.zip`, containing `<project>.gdb/` at the archive root
+- headers include `X-Mapplex-Feature-Count` and `X-Mapplex-Layer-Count`
+
 ## Current Scope
 
-This worker is import-only:
+- Import: `.gdb.zip` -> `.gpkg` + Mapplex domain/attachment bridges.
+- Export Phase A: Mapplex `.gpkg` -> `.gdb.zip`, including feature geometry,
+  typed fields, WGS84 CRS, coded domains, forms, Smart Logic, layer styles, and
+  semantic aliases.
 
-`.gdb.zip` -> `.gpkg` + Mapplex domain tables
-
-FileGDB export should be a separate endpoint later:
-
-Mapplex GPKG/schema bundle -> `.gdb.zip`
-
-GDAL/OpenFileGDB supports FileGDB vector write/create in modern GDAL, so export
-is technically viable, but it should be implemented after import is validated
-with real customer geodatabases.
+Mapplex metadata is stored as a non-spatial FileGDB table and is restored only
+after the importing user explicitly approves it. Native ArcGIS attachment
+relationship-class creation and arbitrary ArcGIS relationship export are not
+part of Phase A. Existing attachment summaries and Mapplex tables may travel as
+ordinary attribute data, but consumers must not treat them as ArcGIS-native
+attachment relationships.
